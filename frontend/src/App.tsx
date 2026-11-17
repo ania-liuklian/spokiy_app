@@ -1,4 +1,14 @@
-import { FormEvent, ReactNode, useEffect, useState } from "react";
+import { pairDevice, type Bluetooth, type BluetoothDevice } from "./bluetooth";
+import { FormEvent, ReactNode, useEffect, useState, useCallback, useRef } from "react";
+import {
+  api,
+  ApiError,
+  type User,
+  type Profile,
+  type Device,
+  type Summary,
+  type ActivityDay,
+} from "./api";
 
 type IconName =
   | "activity"
@@ -72,43 +82,204 @@ function Icon({ name, className = "h-5 w-5" }: { name: IconName; className?: str
   );
 }
 
-const days = [
-  { day: "Mon", value: 54 },
-  { day: "Tue", value: 78 },
-  { day: "Wed", value: 62 },
-  { day: "Thu", value: 88 },
-  { day: "Fri", value: 68 },
-  { day: "Sat", value: 96 },
-  { day: "Sun", value: 80 },
-];
-
 function App() {
-  const [loggedIn, setLoggedIn] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
+  const [checkingSession, setCheckingSession] = useState(true);
+  const [registering, setRegistering] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [profile, setProfile] = useState<Profile>({});
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [summary, setSummary] = useState<Summary | null>(null);
+  const [history, setHistory] = useState<ActivityDay[]>([]);
+  const [loadingData, setLoadingData] = useState(false);
+  const [dataReady, setDataReady] = useState(false);
   const [page, setPage] = useState<"dashboard" | "profile">("dashboard");
   const [showPassword, setShowPassword] = useState(false);
   const [connectOpen, setConnectOpen] = useState(false);
-  const [connection, setConnection] = useState<"idle" | "scanning" | "found" | "connected">("idle");
   const [saved, setSaved] = useState(false);
   const [mobileMenu, setMobileMenu] = useState(false);
+  const [bluetoothName, setBluetoothName] = useState("");
+  const [pairing, setPairing] = useState(false);
+  const bluetoothDevice = useRef<BluetoothDevice | null>(null);
+  const pairAttempt = useRef(0);
+  const disconnectBluetooth = useCallback(() => {
+    pairAttempt.current++;
+    bluetoothDevice.current?.gatt?.disconnect();
+    bluetoothDevice.current = null;
+    setBluetoothName("");
+  }, []);
 
   useEffect(() => {
-    if (connection !== "scanning") return;
-    const timer = window.setTimeout(() => setConnection("found"), 1800);
-    return () => window.clearTimeout(timer);
-  }, [connection]);
+    if (!user) disconnectBluetooth();
+    return disconnectBluetooth;
+  }, [user, disconnectBluetooth]);
 
-  function login(event: FormEvent) {
+  const handleError = useCallback((cause: unknown) => {
+    if (cause instanceof ApiError && cause.status === 401) {
+      setUser(null);
+      setProfile({});
+      setDevices([]);
+      setSummary(null);
+      setHistory([]);
+      setDataReady(false);
+      setConnectOpen(false);
+    }
+    setError(cause instanceof Error ? cause.message : "Something went wrong. Please try again.");
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    api<{ user: User }>("/auth/me")
+      .then((result) => {
+        if (active) setUser(result.user);
+      })
+      .catch((cause) => {
+        if (active && !(cause instanceof ApiError && cause.status === 401)) handleError(cause);
+      })
+      .finally(() => {
+        if (active) setCheckingSession(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [handleError]);
+
+  const refresh = useCallback(
+    async (signal?: AbortSignal) => {
+      setLoadingData(true);
+      // Today uses local midnight. Weekly bars are explicitly grouped by UTC date.
+      const now = new Date();
+      const midnight = new Date(now);
+      midnight.setHours(0, 0, 0, 0);
+      const weekStart = new Date(now);
+      weekStart.setUTCHours(0, 0, 0, 0);
+      weekStart.setUTCDate(weekStart.getUTCDate() - 6);
+      const range = (from: Date) =>
+        `?from=${encodeURIComponent(from.toISOString())}&to=${encodeURIComponent(now.toISOString())}`;
+      try {
+        const [p, d, total, h] = await Promise.all([
+          api<{ profile: Profile }>("/profile"),
+          api<{ devices: Device[] }>("/devices"),
+          api<Summary>("/activity/summary" + range(midnight)),
+          api<{ days: ActivityDay[] }>("/activity/history" + range(weekStart)),
+        ]);
+        if (signal?.aborted) return;
+        setProfile(p.profile);
+        setDevices(d.devices);
+        setSummary(total);
+        setHistory(h.days);
+        setDataReady(true);
+      } catch (cause) {
+        if (!signal?.aborted) handleError(cause);
+      } finally {
+        if (!signal?.aborted) setLoadingData(false);
+      }
+    },
+    [handleError],
+  );
+
+  useEffect(() => {
+    if (!user) return;
+    const controller = new AbortController();
+    void refresh(controller.signal);
+    return () => controller.abort();
+  }, [user, refresh]);
+
+  async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setLoggedIn(true);
+    setBusy(true);
+    setError("");
+    const form = new FormData(event.currentTarget);
+    try {
+      const result = await api<{ user: User }>(
+        registering ? "/auth/register" : "/auth/login",
+        "POST",
+        {
+          email: form.get("email"),
+          password: form.get("password"),
+        },
+      );
+      setUser(result.user);
+      setDataReady(false);
+      setPage("dashboard");
+      setSaved(false);
+    } catch (cause) {
+      handleError(cause);
+    } finally {
+      setBusy(false);
+    }
   }
 
-  function logout() {
-    setLoggedIn(false);
-    setPage("dashboard");
-    setConnection("idle");
+  async function logout() {
+    setBusy(true);
+    setError("");
+    try {
+      await api("/auth/logout", "POST", {});
+      setUser(null);
+      setProfile({});
+      setDevices([]);
+      setSummary(null);
+      setHistory([]);
+      setDataReady(false);
+      setPage("dashboard");
+      setConnectOpen(false);
+      setMobileMenu(false);
+    } catch (cause) {
+      handleError(cause);
+    } finally {
+      setBusy(false);
+    }
   }
 
-  if (!loggedIn) {
+  async function saveProfile(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    setSaved(false);
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    const payload: Record<string, string | number> = {};
+    for (const [key, value] of Object.entries(values)) {
+      if (["heightCm", "weightKg", "dailyStepGoal"].includes(key)) {
+        if (value !== "") payload[key] = Number(value);
+      } else payload[key] = String(value);
+    }
+    try {
+      const result = await api<{ profile: Profile }>("/profile", "PATCH", payload);
+      setProfile(result.profile);
+      setSaved(true);
+    } catch (cause) {
+      handleError(cause);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const displayName =
+    [profile.firstName, profile.lastName].filter(Boolean).join(" ") || user?.email || "";
+  const initials = (profile.firstName?.[0] || user?.email[0] || "") + (profile.lastName?.[0] || "");
+  const goal = profile.dailyStepGoal || 10000;
+  const steps = summary?.steps || 0;
+  const percent = Math.round((steps / goal) * 100);
+  const days = Array.from({ length: 7 }, (_, index) => {
+    const day = new Date();
+    day.setUTCDate(day.getUTCDate() - 6 + index);
+    const count = history.find((item) => item.date === day.toISOString().slice(0, 10))?.steps || 0;
+    return {
+      day: day.toLocaleDateString(undefined, { weekday: "short", timeZone: "UTC" }),
+      steps: count,
+      value: Math.min(100, (count / Math.max(goal, ...history.map((item) => item.steps))) * 100),
+    };
+  });
+
+  if (checkingSession)
+    return (
+      <main className="grid min-h-screen place-items-center" role="status">
+        Checking your session...
+      </main>
+    );
+
+  if (!user) {
     return (
       <main className="min-h-screen bg-[#f4f7f4] text-[#15221c] lg:grid lg:grid-cols-[1.08fr_.92fr]">
         <section className="relative hidden min-h-screen overflow-hidden bg-[#10261d] p-14 text-white lg:flex lg:flex-col lg:justify-between">
@@ -157,36 +328,41 @@ function App() {
             </div>
             <div className="mb-9">
               <p className="mb-3 text-sm font-semibold uppercase tracking-[.18em] text-[#4d7c5d]">
-                Welcome back
+                {registering ? "Get started" : "Welcome back"}
               </p>
-              <h2 className="text-4xl font-semibold tracking-[-.04em]">Sign in to your account</h2>
+              <h2 className="text-4xl font-semibold tracking-[-.04em]">
+                {registering ? "Create your account" : "Sign in to your account"}
+              </h2>
               <p className="mt-3 text-[#68746e]">Continue tracking your movement and progress.</p>
             </div>
+            {error && (
+              <p role="alert" className="mb-4 rounded-xl bg-red-50 p-3 text-sm text-red-800">
+                {error}
+              </p>
+            )}
             <form onSubmit={login} className="space-y-5">
               <label className="block">
                 <span className="mb-2 block text-sm font-semibold">Email address</span>
                 <input
                   required
                   type="email"
-                  defaultValue="alex.morgan@example.com"
+                  name="email"
+                  autoComplete="email"
                   className="w-full rounded-xl border border-[#d9e0dc] bg-white px-4 py-3.5 outline-none transition focus:border-[#346b4b] focus:ring-4 focus:ring-[#346b4b]/10"
                 />
               </label>
               <label className="block">
                 <div className="mb-2 flex items-center justify-between">
                   <span className="text-sm font-semibold">Password</span>
-                  <button
-                    type="button"
-                    className="text-sm font-semibold text-[#346b4b] hover:underline"
-                  >
-                    Forgot password?
-                  </button>
                 </div>
                 <div className="relative">
                   <input
                     required
                     type={showPassword ? "text" : "password"}
-                    defaultValue="spokiy"
+                    name="password"
+                    minLength={12}
+                    maxLength={128}
+                    autoComplete={registering ? "new-password" : "current-password"}
                     className="w-full rounded-xl border border-[#d9e0dc] bg-white px-4 py-3.5 pr-16 outline-none transition focus:border-[#346b4b] focus:ring-4 focus:ring-[#346b4b]/10"
                   />
                   <button
@@ -198,21 +374,27 @@ function App() {
                   </button>
                 </div>
               </label>
-              <label className="flex items-center gap-3 text-sm text-[#54615b]">
-                <input type="checkbox" defaultChecked className="h-4 w-4 accent-[#214f39]" />
-                Keep me signed in
-              </label>
-              <button className="w-full rounded-xl bg-[#214f39] py-4 font-semibold text-white shadow-lg shadow-[#214f39]/15 transition hover:bg-[#183c2b]">
-                Sign in
+              <p className="text-sm text-[#54615b]">
+                Use at least 12 characters. Sessions last seven days.
+              </p>
+              <button
+                disabled={busy}
+                className="disabled:opacity-50 w-full rounded-xl bg-[#214f39] py-4 font-semibold text-white shadow-lg shadow-[#214f39]/15 transition hover:bg-[#183c2b]"
+              >
+                {busy ? "Please wait..." : registering ? "Create account" : "Sign in"}
               </button>
             </form>
             <p className="mt-8 text-center text-sm text-[#6c7772]">
-              New to spokiy?{" "}
+              {registering ? "Already have an account?" : "New to spokiy?"}{" "}
               <button
-                onClick={() => setLoggedIn(true)}
+                disabled={busy}
+                onClick={() => {
+                  setRegistering(!registering);
+                  setError("");
+                }}
                 className="font-bold text-[#285b40] hover:underline"
               >
-                Create an account
+                {registering ? "Sign in" : "Create an account"}
               </button>
             </p>
           </div>
@@ -258,21 +440,20 @@ function App() {
             <div className="mb-3 flex items-center justify-between">
               <span className="text-xs font-medium text-white/50">DEVICE STATUS</span>
               <span
-                className={`h-2 w-2 rounded-full ${connection === "connected" ? "bg-[#a8e063]" : "bg-white/25"}`}
+                className={`h-2 w-2 rounded-full ${bluetoothName ? "bg-[#a8e063]" : "bg-white/25"}`}
               />
             </div>
-            <p className="text-sm font-semibold">
-              {connection === "connected" ? "MoveBand S3" : "No device connected"}
-            </p>
+            <p className="text-sm font-semibold">{bluetoothName || "No device connected"}</p>
             <button
               onClick={() => setConnectOpen(true)}
               className="mt-1 text-xs font-semibold text-[#a8e063]"
             >
-              {connection === "connected" ? "Manage device" : "Connect now"}
+              {bluetoothName ? "Manage device" : "Connect now"}
             </button>
           </div>
           <button
             onClick={logout}
+            disabled={busy}
             className="flex w-full items-center gap-3 px-4 py-3 text-sm font-semibold text-white/50 hover:text-white"
           >
             <Icon name="logout" />
@@ -287,61 +468,100 @@ function App() {
             onClick={() => setMobileMenu(true)}
             className="grid h-10 w-10 place-items-center rounded-xl border border-[#dfe5e1] lg:hidden"
           >
-            <span className="text-xl">≡</span>
+            <span className="text-xl">☰</span>
           </button>
           <div className="hidden sm:block">
             <p className="text-xs font-semibold uppercase tracking-[.15em] text-[#7a857f]">
-              {page === "dashboard" ? "Tuesday, June 17" : "Account"}
+              {page === "dashboard"
+                ? new Date().toLocaleDateString(undefined, {
+                    weekday: "long",
+                    month: "long",
+                    day: "numeric",
+                  })
+                : "Account"}
             </p>
             <h1 className="mt-1 text-xl font-bold">
-              {page === "dashboard" ? "Good morning, Alex" : "Your profile"}
+              {page === "dashboard" ? `Hello, ${profile.firstName || user.email}` : "Your profile"}
             </h1>
           </div>
           <div className="ml-auto flex items-center gap-3">
             <button
               onClick={() => setConnectOpen(true)}
-              className={`hidden items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold sm:flex ${connection === "connected" ? "bg-[#e9f4e9] text-[#2e6343]" : "bg-[#214f39] text-white"}`}
+              className={`hidden items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold sm:flex ${bluetoothName ? "bg-[#e9f4e9] text-[#2e6343]" : "bg-[#214f39] text-white"}`}
             >
               <Icon name="bluetooth" className="h-4 w-4" />
-              {connection === "connected" ? "MoveBand S3" : "Connect device"}
+              {bluetoothName || "Connect device"}
             </button>
             <button
               onClick={() => setPage("profile")}
               className="grid h-11 w-11 place-items-center rounded-full bg-[#dce9df] text-sm font-bold text-[#28573d]"
             >
-              AM
+              {initials.toUpperCase()}
             </button>
           </div>
         </header>
 
-        {page === "dashboard" ? (
+        <div className="px-5 pt-4 sm:px-8 lg:px-10">
+          {error && (
+            <p role="alert" className="rounded-xl bg-red-50 p-3 text-red-800">
+              {error}
+            </p>
+          )}
+          {loadingData && <p role="status">Loading your data...</p>}
+          <button
+            disabled={loadingData || busy}
+            onClick={() => {
+              setError("");
+              void refresh();
+            }}
+            className="mt-2 text-sm font-semibold text-[#28573d]"
+          >
+            Refresh data
+          </button>
+          {summary?.samples === 0 && (
+            <p className="mt-2 text-sm text-[#748078]">
+              No measurements today. Connect your tracker to get started.
+            </p>
+          )}
+        </div>
+        {page === "profile" && !dataReady ? (
+          <p className="p-8">Your profile has not loaded. Use Refresh data to retry.</p>
+        ) : page === "dashboard" ? (
           <div className="mx-auto max-w-[1380px] p-5 sm:p-8 lg:p-10">
             <section className="mb-8 overflow-hidden rounded-[28px] bg-[#183d2c] text-white">
               <div className="grid items-center gap-8 p-7 sm:p-9 lg:grid-cols-[1fr_auto]">
                 <div>
                   <div className="mb-5 flex items-center gap-2 text-sm text-white/60">
                     <span className="h-2 w-2 rounded-full bg-[#a8e063]" />
-                    Today’s progress
+                    Today's progress
                   </div>
                   <div className="flex flex-wrap items-end gap-x-12 gap-y-5">
                     <div>
-                      <p className="text-5xl font-semibold tracking-[-.05em]">8,462</p>
-                      <p className="mt-2 text-sm text-white/55">of 10,000 daily steps</p>
+                      <p className="text-5xl font-semibold tracking-[-.05em]">
+                        {summary ? steps.toLocaleString() : "--"}
+                      </p>
+                      <p className="mt-2 text-sm text-white/55">
+                        of {goal.toLocaleString()} daily steps
+                      </p>
                     </div>
                     <div className="pb-1">
-                      <p className="text-2xl font-semibold">84%</p>
+                      <p className="text-2xl font-semibold">{summary ? `${percent}%` : "--"}</p>
                       <p className="mt-1 text-xs text-white/45">Goal completed</p>
                     </div>
                   </div>
                   <div className="mt-7 h-2 max-w-2xl overflow-hidden rounded-full bg-white/10">
-                    <div className="h-full w-[84%] rounded-full bg-[#a8e063]" />
+                    <div
+                      className="h-full rounded-full bg-[#a8e063]"
+                      style={{ width: `${Math.min(100, percent)}%` }}
+                    />
                   </div>
                 </div>
                 <div className="relative mx-auto grid h-36 w-36 place-items-center rounded-full border-[9px] border-white/10">
-                  <div className="absolute inset-[-9px] rounded-full border-[9px] border-transparent border-r-[#a8e063] border-t-[#a8e063] rotate-45" />
                   <div className="text-center">
                     <Icon name="steps" className="mx-auto h-7 w-7 text-[#a8e063]" />
-                    <span className="mt-1 block text-xs text-white/55">1,538 to go</span>
+                    <span className="mt-1 block text-xs text-white/55">
+                      {Math.max(0, goal - steps).toLocaleString()} to go
+                    </span>
                   </div>
                 </div>
               </div>
@@ -352,21 +572,20 @@ function App() {
                 <div className="mb-8 flex items-center justify-between">
                   <div>
                     <h2 className="font-bold">Weekly activity</h2>
-                    <p className="mt-1 text-sm text-[#7a857f]">Steps across the last 7 days</p>
+                    <p className="mt-1 text-sm text-[#7a857f]">
+                      Steps across the last 7 days (UTC)
+                    </p>
                   </div>
-                  <button className="flex items-center gap-1 text-sm font-semibold text-[#526159]">
-                    This week{" "}
-                    <span className="rotate-90">
-                      <Icon name="chevron" className="h-4 w-4" />
-                    </span>
-                  </button>
                 </div>
                 <div className="flex h-52 items-end gap-3 sm:gap-5">
                   {days.map((day, index) => (
                     <div key={day.day} className="flex h-full flex-1 flex-col justify-end gap-3">
-                      <div className="relative flex-1 rounded-lg bg-[#f2f5f2]">
+                      <div
+                        className="relative flex-1 rounded-lg bg-[#f2f5f2]"
+                        title={`${day.steps.toLocaleString()} steps`}
+                      >
                         <div
-                          className={`absolute inset-x-0 bottom-0 rounded-lg ${index === 5 ? "bg-[#214f39]" : "bg-[#a9d39d]"}`}
+                          className={`absolute inset-x-0 bottom-0 rounded-lg ${index === 6 ? "bg-[#214f39]" : "bg-[#a9d39d]"}`}
                           style={{ height: `${day.value}%` }}
                         />
                       </div>
@@ -382,48 +601,29 @@ function App() {
                   <div>
                     <h2 className="font-bold">Device health</h2>
                     <p className="mt-1 text-sm text-[#7a857f]">
-                      {connection === "connected" ? "MoveBand S3" : "Connect to sync data"}
+                      {bluetoothName || "No Bluetooth connection"}
                     </p>
                   </div>
                   <Icon name="device" className="text-[#50725e]" />
                 </div>
-                {connection === "connected" ? (
-                  <div className="space-y-5">
-                    <div className="rounded-xl bg-[#f4f7f4] p-4">
-                      <div className="flex justify-between text-sm">
-                        <span className="flex items-center gap-2 font-semibold">
-                          <Icon name="battery" className="h-4 w-4" />
-                          Battery
-                        </span>
-                        <span className="font-bold text-[#347049]">78%</span>
-                      </div>
-                      <div className="mt-3 h-1.5 rounded-full bg-[#dce4dd]">
-                        <div className="h-full w-[78%] rounded-full bg-[#65a66f]" />
-                      </div>
-                    </div>
-                    <div className="grid grid-cols-2 gap-3 text-sm">
-                      <div className="rounded-xl border border-[#e5e9e6] p-4">
-                        <p className="text-[#7a857f]">Last sync</p>
-                        <p className="mt-1 font-semibold">Just now</p>
-                      </div>
-                      <div className="rounded-xl border border-[#e5e9e6] p-4">
-                        <p className="text-[#7a857f]">Firmware</p>
-                        <p className="mt-1 font-semibold">v2.4.1</p>
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <button
-                    onClick={() => setConnectOpen(true)}
-                    className="flex min-h-40 w-full flex-col items-center justify-center rounded-xl border border-dashed border-[#cad5cd] bg-[#f8faf8] text-center"
-                  >
-                    <span className="mb-3 grid h-12 w-12 place-items-center rounded-full bg-[#e4efe6] text-[#39694d]">
-                      <Icon name="bluetooth" />
-                    </span>
-                    <span className="font-semibold">Pair your STM32 device</span>
-                    <span className="mt-1 text-xs text-[#7b867f]">Tap to start discovering</span>
-                  </button>
-                )}
+                <p className="text-sm text-[#748078]">
+                  {bluetoothName
+                    ? "Connected over Bluetooth. Measurement syncing awaits firmware configuration."
+                    : "Connect your tracker over Bluetooth."}{" "}
+                  ({devices.length} saved devices)
+                </p>
+                <p className="mt-3 text-sm text-[#748078]">
+                  Average heart rate today:{" "}
+                  {summary?.averageHeartRate == null
+                    ? "No readings"
+                    : `${Math.round(summary.averageHeartRate)} bpm`}
+                </p>
+                <button
+                  onClick={() => setConnectOpen(true)}
+                  className="mt-6 rounded-xl bg-[#214f39] px-4 py-3 text-white"
+                >
+                  {bluetoothName ? "Manage device" : "Connect device"}
+                </button>
               </article>
             </section>
           </div>
@@ -434,60 +634,74 @@ function App() {
               <p className="mt-2 text-[#748078]">Manage your details and health preferences.</p>
             </div>
             <form
-              onSubmit={(event) => {
-                event.preventDefault();
-                setSaved(true);
-                window.setTimeout(() => setSaved(false), 2500);
-              }}
+              key={JSON.stringify(profile)}
+              onSubmit={saveProfile}
+              onChange={() => setSaved(false)}
               className="overflow-hidden rounded-2xl border border-[#e1e7e2] bg-white"
             >
               <div className="flex flex-col gap-5 border-b border-[#e7ebe8] p-6 sm:flex-row sm:items-center">
                 <div className="grid h-20 w-20 place-items-center rounded-full bg-[#dbeadd] text-xl font-bold text-[#28573d]">
-                  AM
+                  {initials.toUpperCase()}
                 </div>
                 <div className="flex-1">
-                  <h3 className="text-xl font-bold">Alex Morgan</h3>
-                  <p className="mt-1 text-sm text-[#76827b]">Member since January 2024</p>
+                  <h3 className="text-xl font-bold">{displayName}</h3>
+                  <p className="mt-1 text-sm text-[#76827b]">
+                    Member since {new Date(user.createdAt).toLocaleDateString()}
+                  </p>
                 </div>
-                <button
-                  type="button"
-                  className="rounded-xl border border-[#dce2de] px-4 py-2.5 text-sm font-semibold"
-                >
-                  Change photo
-                </button>
               </div>
               <div className="grid gap-5 p-6 sm:grid-cols-2">
-                {[
-                  ["First name", "Alex", "text"],
-                  ["Last name", "Morgan", "text"],
-                  ["Email address", "alex.morgan@example.com", "email"],
-                  ["Phone number", "+1 (415) 555-0142", "tel"],
-                  ["Date of birth", "1992-08-14", "date"],
-                  ["Location", "San Francisco, CA", "text"],
-                ].map(([label, value, type]) => (
-                  <label key={label} className="block">
+                {(
+                  [
+                    ["First name", "firstName", "text"],
+                    ["Last name", "lastName", "text"],
+                    ["Phone number", "phone", "tel"],
+                    ["Date of birth", "dateOfBirth", "date"],
+                    ["Location", "location", "text"],
+                  ] as const
+                ).map(([label, key, type]) => (
+                  <label key={key} className="block">
                     <span className="mb-2 block text-sm font-semibold">{label}</span>
                     <input
+                      name={key}
                       type={type}
-                      defaultValue={value}
-                      className="w-full rounded-xl border border-[#dce2de] px-4 py-3 outline-none focus:border-[#346b4b] focus:ring-4 focus:ring-[#346b4b]/10"
+                      maxLength={200}
+                      defaultValue={String(profile[key] || "")}
+                      className="w-full rounded-xl border border-[#dce2de] px-4 py-3"
                     />
                   </label>
                 ))}
+                <label className="block">
+                  <span className="mb-2 block text-sm font-semibold">Email address</span>
+                  <input
+                    type="email"
+                    value={user.email}
+                    readOnly
+                    className="w-full rounded-xl border border-[#dce2de] bg-gray-50 px-4 py-3"
+                  />
+                </label>
               </div>
               <div className="border-t border-[#e7ebe8] p-6">
                 <h3 className="mb-5 font-bold">Health details</h3>
                 <div className="grid gap-5 sm:grid-cols-3">
-                  {[
-                    ["Height", "178 cm"],
-                    ["Weight", "74 kg"],
-                    ["Daily step goal", "10,000 steps"],
-                  ].map(([label, value]) => (
-                    <label key={label}>
+                  {(
+                    [
+                      ["Height (cm)", "heightCm", 30, 300],
+                      ["Weight (kg)", "weightKg", 1, 700],
+                      ["Daily step goal", "dailyStepGoal", 1, 1000000],
+                    ] as const
+                  ).map(([label, key, min, max]) => (
+                    <label key={key}>
                       <span className="mb-2 block text-sm font-semibold">{label}</span>
                       <input
-                        defaultValue={value}
-                        className="w-full rounded-xl border border-[#dce2de] px-4 py-3 outline-none focus:border-[#346b4b]"
+                        name={key}
+                        type="number"
+                        min={min}
+                        max={max}
+                        step={key === "dailyStepGoal" ? 1 : "any"}
+                        required={key === "dailyStepGoal"}
+                        defaultValue={profile[key] ?? ""}
+                        className="w-full rounded-xl border border-[#dce2de] px-4 py-3"
                       />
                     </label>
                   ))}
@@ -497,8 +711,11 @@ function App() {
                 {saved && (
                   <span className="text-sm font-semibold text-[#39704e]">Changes saved</span>
                 )}
-                <button className="rounded-xl bg-[#214f39] px-6 py-3 text-sm font-semibold text-white">
-                  Save changes
+                <button
+                  disabled={busy || !dataReady}
+                  className="disabled:opacity-50 rounded-xl bg-[#214f39] px-6 py-3 text-sm font-semibold text-white"
+                >
+                  {busy ? "Saving..." : "Save changes"}
                 </button>
               </div>
             </form>
@@ -507,104 +724,113 @@ function App() {
       </main>
 
       {connectOpen && (
-        <div
-          className="fixed inset-0 z-50 grid place-items-center bg-[#0b1711]/55 p-4 backdrop-blur-sm"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setConnectOpen(false);
-          }}
-        >
-          <div className="w-full max-w-md rounded-[24px] bg-white p-6 shadow-2xl">
-            <div className="mb-6 flex items-start justify-between">
-              <div>
-                <h2 className="text-xl font-bold">Connect a device</h2>
-                <p className="mt-1 text-sm text-[#738078]">Pair your STM32-powered wearable.</p>
-              </div>
+        <div className="fixed inset-0 z-50 grid place-items-center bg-[#0b1711]/55 p-4 backdrop-blur-sm">
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="devices-title"
+            className="w-full max-w-md rounded-3xl bg-white p-6"
+          >
+            <div className="flex items-center justify-between">
+              <h2 id="devices-title" className="text-xl font-bold">
+                Connect a device
+              </h2>
               <button
+                aria-label="Close Bluetooth dialog"
+                disabled={pairing}
                 onClick={() => setConnectOpen(false)}
-                className="grid h-9 w-9 place-items-center rounded-full bg-[#f0f3f1] text-[#5f6d65]"
               >
-                <Icon name="close" className="h-4 w-4" />
+                <Icon name="close" />
               </button>
             </div>
-            {connection === "idle" && (
-              <div className="py-5 text-center">
-                <div className="mx-auto mb-6 grid h-24 w-24 place-items-center rounded-full bg-[#eaf3eb] text-[#346a49]">
-                  <Icon name="bluetooth" className="h-10 w-10" />
-                </div>
-                <h3 className="font-bold">Ready to pair</h3>
-                <p className="mx-auto mt-2 max-w-xs text-sm leading-6 text-[#748078]">
-                  Keep your device nearby and make sure Bluetooth pairing mode is enabled.
-                </p>
-                <button
-                  onClick={() => setConnection("scanning")}
-                  className="mt-7 w-full rounded-xl bg-[#214f39] py-3.5 font-semibold text-white"
-                >
-                  Find devices
-                </button>
+            <div className="py-6 text-center">
+              <div className="mx-auto mb-5 grid h-20 w-20 place-items-center rounded-full bg-[#e6f2e7] text-[#347049]">
+                <Icon name="bluetooth" className="h-9 w-9" />
               </div>
-            )}
-            {connection === "scanning" && (
-              <div className="py-10 text-center">
-                <div className="relative mx-auto mb-7 h-24 w-24">
-                  <div className="absolute inset-0 animate-ping rounded-full bg-[#7eb98a]/20" />
-                  <div className="absolute inset-3 grid place-items-center rounded-full bg-[#e6f1e8] text-[#346a49]">
-                    <Icon name="bluetooth" className="h-8 w-8" />
-                  </div>
-                </div>
-                <h3 className="font-bold">Searching nearby...</h3>
-                <p className="mt-2 text-sm text-[#748078]">This may take a few seconds</p>
-              </div>
-            )}
-            {connection === "found" && (
-              <div>
-                <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-[#77837c]">
-                  Available device
+              <h3 className="text-lg font-bold">
+                {bluetoothName ? `${bluetoothName} connected` : "Pair your STM32 device"}
+              </h3>
+              <p className="mt-3 text-sm text-[#748078]">
+                {bluetoothName
+                  ? "Bluetooth is connected. Activity syncing still needs your firmware service, characteristic and measurement format."
+                  : "Keep your wearable nearby with Bluetooth enabled. Choose it in the browser Bluetooth window."}
+              </p>
+              {error && (
+                <p role="alert" className="mt-4 text-sm text-red-800">
+                  {error}
                 </p>
+              )}
+              {bluetoothName ? (
                 <button
-                  onClick={() => setConnection("connected")}
-                  className="flex w-full items-center gap-4 rounded-2xl border border-[#cfdad2] p-4 text-left transition hover:bg-[#f5f8f5]"
-                >
-                  <span className="grid h-12 w-12 place-items-center rounded-xl bg-[#dfeee1] text-[#346a49]">
-                    <Icon name="device" />
-                  </span>
-                  <span className="flex-1">
-                    <span className="block font-bold">MoveBand S3</span>
-                    <span className="mt-1 block text-xs text-[#7b867f]">STM32 • Signal strong</span>
-                  </span>
-                  <Icon name="chevron" className="h-5 w-5 text-[#8a948e]" />
-                </button>
-                <button
-                  onClick={() => setConnection("scanning")}
-                  className="mt-5 w-full py-2 text-sm font-semibold text-[#346a49]"
-                >
-                  Search again
-                </button>
-              </div>
-            )}
-            {connection === "connected" && (
-              <div className="py-5 text-center">
-                <div className="mx-auto mb-5 grid h-20 w-20 place-items-center rounded-full bg-[#e6f2e7] text-[#347049]">
-                  <Icon name="device" className="h-9 w-9" />
-                </div>
-                <h3 className="text-lg font-bold">MoveBand S3 connected</h3>
-                <p className="mt-2 text-sm text-[#748078]">
-                  Your activity data is now syncing securely.
-                </p>
-                <button
-                  onClick={() => setConnectOpen(false)}
-                  className="mt-7 w-full rounded-xl bg-[#214f39] py-3.5 font-semibold text-white"
-                >
-                  Done
-                </button>
-                <button
-                  onClick={() => setConnection("idle")}
-                  className="mt-3 w-full py-2 text-sm font-semibold text-[#a15050]"
+                  onClick={disconnectBluetooth}
+                  className="mt-6 w-full rounded-xl border py-3 text-[#a15050]"
                 >
                   Disconnect device
                 </button>
-              </div>
-            )}
-          </div>
+              ) : (
+                <button
+                  disabled={pairing || busy}
+                  className="mt-6 w-full rounded-xl bg-[#214f39] py-3.5 font-semibold text-white disabled:opacity-50"
+                  onClick={async () => {
+                    setError("");
+                    setPairing(true);
+                    const attempt = ++pairAttempt.current;
+                    let selected: BluetoothDevice | undefined;
+                    try {
+                      selected = await pairDevice(
+                        (navigator as Navigator & { bluetooth?: Bluetooth }).bluetooth,
+                        import.meta.env.VITE_BLE_SERVICE_UUID,
+                      );
+                      if (attempt !== pairAttempt.current) {
+                        selected.gatt?.disconnect();
+                        return;
+                      }
+                      const device = selected;
+                      bluetoothDevice.current = device;
+                      device.addEventListener(
+                        "gattserverdisconnected",
+                        () => {
+                          if (bluetoothDevice.current === device) {
+                            bluetoothDevice.current = null;
+                            setBluetoothName("");
+                          }
+                        },
+                        { once: true },
+                      );
+                      await api("/devices", "POST", {
+                        identifier: device.id,
+                        name: device.name || "STM32 tracker",
+                      });
+                      if (attempt !== pairAttempt.current) {
+                        device.gatt?.disconnect();
+                        return;
+                      }
+                      if (!device.gatt?.connected)
+                        throw new Error("Device disconnected while connecting. Please try again.");
+                      setBluetoothName(device.name || "STM32 tracker");
+                      await refresh();
+                    } catch (cause) {
+                      selected?.gatt?.disconnect();
+                      if (attempt === pairAttempt.current) {
+                        bluetoothDevice.current = null;
+                        setBluetoothName("");
+                        if (!(cause instanceof DOMException && cause.name === "NotFoundError"))
+                          handleError(cause);
+                      }
+                    } finally {
+                      setPairing(false);
+                    }
+                  }}
+                >
+                  {pairing ? "Connecting..." : "Find Bluetooth devices"}
+                </button>
+              )}
+              <p className="mt-4 text-xs text-[#748078]">
+                Use Chrome or Edge on localhost or HTTPS. Your tracker must support Bluetooth Low
+                Energy (BLE).
+              </p>
+            </div>
+          </section>
         </div>
       )}
     </div>
