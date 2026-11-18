@@ -1,4 +1,5 @@
-import { pairDevice, type Bluetooth, type BluetoothDevice } from "./bluetooth";
+import { type Prediction } from "./predictions";
+import { pairDevice, subscribePredictions, type Bluetooth, type BluetoothDevice } from "./bluetooth";
 import { FormEvent, ReactNode, useEffect, useState, useCallback, useRef } from "react";
 import {
   api,
@@ -101,10 +102,23 @@ function App() {
   const [mobileMenu, setMobileMenu] = useState(false);
   const [bluetoothName, setBluetoothName] = useState("");
   const [pairing, setPairing] = useState(false);
+  const [monitored, setMonitored] = useState<{ id: string; email: string; activity: string | null; confidence: number | null; receivedAt: string | null }[]>([]);
+  const [admins, setAdmins] = useState<{ id: string; email: string }[]>([]);
+  const [monitorEmail, setMonitorEmail] = useState("");
+  const [activityNotice, setActivityNotice] = useState("");
+  const previousActivity = useRef<Map<string, string> | null>(null);
+  const [monitorError, setMonitorError] = useState("");
+  const uploadQueue = useRef<Promise<void>>(Promise.resolve());
+  const [prediction, setPrediction] = useState<Prediction | null>(null);
+  const [bleSubscribed, setBleSubscribed] = useState(false);
   const bluetoothDevice = useRef<BluetoothDevice | null>(null);
+  const unsubscribeBle = useRef<(() => void) | null>(null);
   const pairAttempt = useRef(0);
   const disconnectBluetooth = useCallback(() => {
     pairAttempt.current++;
+    unsubscribeBle.current?.();
+    unsubscribeBle.current = null;
+    setBleSubscribed(false);
     bluetoothDevice.current?.gatt?.disconnect();
     bluetoothDevice.current = null;
     setBluetoothName("");
@@ -186,6 +200,30 @@ function App() {
     return () => controller.abort();
   }, [user, refresh]);
 
+  const loadMonitoring = useCallback(async () => {
+    if (!user) return;
+    try {
+      if (user.role === "admin") {
+        const users = (await api<{ users: typeof monitored }>("/monitoring/users")).users;
+        const previous = previousActivity.current;
+        if (previous) {
+          const changed = users.find(person => person.activity && previous.has(person.id) && previous.get(person.id) !== person.activity);
+          if (changed) setActivityNotice(`${changed.email}: ${previous.get(changed.id)} ? ${changed.activity}`);
+        }
+        previousActivity.current = new Map(users.filter(person => person.activity).map(person => [person.id, person.activity as string]));
+        setMonitored(users);
+      }
+      else setAdmins((await api<{ admins: { id: string; email: string }[] }>("/monitoring/grants")).admins);
+      setMonitorError("");
+    } catch (cause) { setMonitorError(cause instanceof Error ? cause.message : "Unable to load monitoring data."); }
+  }, [user]);
+  useEffect(() => {
+    if (!user) { setMonitored([]); setAdmins([]); setPrediction(null); setActivityNotice(""); previousActivity.current = null; return; }
+    void loadMonitoring();
+    const timer = window.setInterval(() => { void loadMonitoring(); }, 3000);
+    return () => window.clearInterval(timer);
+  }, [user, loadMonitoring]);
+
   async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true);
@@ -198,6 +236,7 @@ function App() {
         {
           email: form.get("email"),
           password: form.get("password"),
+          ...(registering ? { role: form.get("role") } : {}),
         },
       );
       setUser(result.user);
@@ -374,6 +413,10 @@ function App() {
                   </button>
                 </div>
               </label>
+              {registering && <label className="block"><span className="mb-2 block text-sm font-semibold">Account type</span>
+                <select name="role" defaultValue="user" className="w-full rounded-xl border border-[#d9e0dc] bg-white px-4 py-3.5">
+                  <option value="user">Regular user</option><option value="admin">Administrator</option>
+                </select><span className="mt-2 block text-sm text-[#54615b]">Administrators can monitor users who explicitly share access with them.</span></label>}
               <p className="text-sm text-[#54615b]">
                 Use at least 12 characters. Sessions last seven days.
               </p>
@@ -528,6 +571,37 @@ function App() {
           <p className="p-8">Your profile has not loaded. Use Refresh data to retry.</p>
         ) : page === "dashboard" ? (
           <div className="mx-auto max-w-[1380px] p-5 sm:p-8 lg:p-10">
+            {user.role === "admin" ? <section className="mb-6 rounded-2xl border border-[#e3e8e4] bg-white p-6">
+              <h2 className="font-bold">Live user activity</h2>
+              <p className="mt-2 text-sm text-[#748078]">Users must grant you access before they appear here. Updates refresh every 3 seconds.</p>
+              {activityNotice && <p role="status" className="mt-3 rounded-xl bg-[#e6f2e7] p-3 text-sm">Activity changed: {activityNotice}</p>}
+              {monitorError && <p role="alert" className="mt-3 text-red-800">{monitorError}</p>}
+              {monitored.length === 0 && <p className="mt-4 text-sm text-[#748078]">No users are sharing activity with you yet.</p>}
+              <ul className="mt-4 space-y-3">{monitored.map(person => <li key={person.id} className="rounded-xl bg-[#f2f5f2] p-4">
+                <p className="font-semibold">{person.email}</p>
+                <p className="mt-1">{person.activity || "No activity received"}{person.confidence != null && ` (${(person.confidence * 100).toFixed(1)}% confidence)`}</p>
+                <p className="mt-1 text-sm text-[#748078]">{person.receivedAt ? `Last received: ${new Date(person.receivedAt).toLocaleString()}${Date.now() - Date.parse(person.receivedAt) > 30000 ? " ? not recently updated" : ""}` : "Waiting for data"}</p>
+              </li>)}</ul>
+              <p className="mt-4 text-xs text-[#748078]">Activity classifications do not detect falls. Check the last received time to judge whether a reading is current.</p>
+            </section> : <>
+            <section aria-live="polite" className="mb-6 rounded-2xl border border-[#e3e8e4] bg-white p-6">
+              <h2 className="font-bold">Live activity prediction</h2>
+              {prediction ? <div className="mt-3"><p className="text-2xl font-semibold text-[#214f39]">{prediction.activity}</p>
+                <p className="mt-1 text-sm text-[#748078]">Model confidence: {(prediction.confidence * 100).toFixed(1)}% ? received {prediction.receivedAt.toLocaleTimeString()}</p>
+                {!bleSubscribed && <p className="mt-1 text-sm text-[#748078]">Disconnected ? showing the last reading.</p>}
+              </div> : <p className="mt-3 text-sm text-[#748078]">{bleSubscribed ? "Waiting for a prediction from the tracker?" : "Connect your tracker with Bluetooth to see live predictions."}</p>}
+              <p className="mt-2 text-xs text-[#748078]">Predictions do not update step counts.</p>
+            </section>
+            <section className="mb-6 rounded-2xl border border-[#e3e8e4] bg-white p-6">
+              <h2 className="font-bold">Share activity with an administrator</h2>
+              <p className="mt-2 text-sm text-[#748078]">Only administrators you add can see your latest activity. You can revoke access at any time.</p>
+              <form className="mt-4 flex flex-wrap gap-2" onSubmit={async event => { event.preventDefault(); try { await api("/monitoring/grants", "POST", { email: monitorEmail }); setMonitorEmail(""); await loadMonitoring(); } catch (cause) { setMonitorError(cause instanceof Error ? cause.message : "Could not share access."); } }}>
+                <input aria-label="Administrator email" type="email" required value={monitorEmail} onChange={event => setMonitorEmail(event.target.value)} placeholder="Administrator email" className="min-w-0 flex-1 rounded-xl border px-4 py-3" />
+                <button className="rounded-xl bg-[#214f39] px-4 py-3 text-white">Share access</button>
+              </form>
+              {monitorError && <p role="alert" className="mt-3 text-sm text-red-800">{monitorError}</p>}
+              <ul className="mt-3 space-y-2">{admins.map(admin => <li key={admin.id} className="flex items-center justify-between gap-3 text-sm">{admin.email}<button className="text-red-800" onClick={async () => { try { await api(`/monitoring/grants?adminId=${encodeURIComponent(admin.id)}`, "DELETE"); await loadMonitoring(); } catch (cause) { setMonitorError(cause instanceof Error ? cause.message : "Could not revoke access."); } }}>Revoke</button></li>)}</ul>
+            </section></>}
             <section className="mb-8 overflow-hidden rounded-[28px] bg-[#183d2c] text-white">
               <div className="grid items-center gap-8 p-7 sm:p-9 lg:grid-cols-[1fr_auto]">
                 <div>
@@ -608,15 +682,9 @@ function App() {
                 </div>
                 <p className="text-sm text-[#748078]">
                   {bluetoothName
-                    ? "Connected over Bluetooth. Measurement syncing awaits firmware configuration."
+                    ? bleSubscribed ? "Receiving live predictions over Bluetooth." : "Connected over Bluetooth; prediction subscription is not configured."
                     : "Connect your tracker over Bluetooth."}{" "}
                   ({devices.length} saved devices)
-                </p>
-                <p className="mt-3 text-sm text-[#748078]">
-                  Average heart rate today:{" "}
-                  {summary?.averageHeartRate == null
-                    ? "No readings"
-                    : `${Math.round(summary.averageHeartRate)} bpm`}
                 </p>
                 <button
                   onClick={() => setConnectOpen(true)}
@@ -752,7 +820,7 @@ function App() {
               </h3>
               <p className="mt-3 text-sm text-[#748078]">
                 {bluetoothName
-                  ? "Bluetooth is connected. Activity syncing still needs your firmware service, characteristic and measurement format."
+                  ? bleSubscribed ? "Bluetooth is connected and listening for live predictions." : "Bluetooth is connected. Configure both UUIDs to receive predictions."
                   : "Keep your wearable nearby with Bluetooth enabled. Choose it in the browser Bluetooth window."}
               </p>
               {error && (
@@ -779,7 +847,7 @@ function App() {
                     try {
                       selected = await pairDevice(
                         (navigator as Navigator & { bluetooth?: Bluetooth }).bluetooth,
-                        import.meta.env.VITE_BLE_SERVICE_UUID,
+                        import.meta.env.VITE_BLE_SERVICE_UUID || "0000aabb-cc7a-482a-984a-7f2ed5b3e58f",
                       );
                       if (attempt !== pairAttempt.current) {
                         selected.gatt?.disconnect();
@@ -791,6 +859,9 @@ function App() {
                         "gattserverdisconnected",
                         () => {
                           if (bluetoothDevice.current === device) {
+                            unsubscribeBle.current?.();
+                            unsubscribeBle.current = null;
+                            setBleSubscribed(false);
                             bluetoothDevice.current = null;
                             setBluetoothName("");
                           }
@@ -807,9 +878,33 @@ function App() {
                       }
                       if (!device.gatt?.connected)
                         throw new Error("Device disconnected while connecting. Please try again.");
+                      const serviceUuid = import.meta.env.VITE_BLE_SERVICE_UUID?.trim() || "0000aabb-cc7a-482a-984a-7f2ed5b3e58f";
+                      const characteristicUuid = import.meta.env.VITE_BLE_CHARACTERISTIC_UUID?.trim() || "00003344-8e22-4541-9d4c-21edae82ed19";
+                      if (serviceUuid && characteristicUuid) {
+                        const unsubscribe = await subscribePredictions(device, serviceUuid, characteristicUuid, (value) => {
+                          if (pairAttempt.current === attempt) {
+                            setPrediction(value);
+                            if (user?.role === "user") {
+                              uploadQueue.current = uploadQueue.current.catch(() => {}).then(async () => {
+                                await api("/predictions", "POST", { userId: user.id, activity: value.activity, confidence: value.confidence, deviceTime: value.timestampMs });
+                              }).catch(() => { setMonitorError("Could not share the latest activity. Check the backend connection."); });
+                            }
+                          }
+                        });
+                        if (attempt !== pairAttempt.current || !device.gatt?.connected) {
+                          unsubscribe();
+                          device.gatt?.disconnect();
+                          return;
+                        }
+                        unsubscribeBle.current = unsubscribe;
+                        setBleSubscribed(true);
+                      }
                       setBluetoothName(device.name || "STM32 tracker");
                       await refresh();
                     } catch (cause) {
+                      unsubscribeBle.current?.();
+                      unsubscribeBle.current = null;
+                      setBleSubscribed(false);
                       selected?.gatt?.disconnect();
                       if (attempt === pairAttempt.current) {
                         bluetoothDevice.current = null;
