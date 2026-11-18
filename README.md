@@ -1,10 +1,11 @@
 # Spokiy
 
-React/Vite frontend and a Node.js backend for activity measurements read from an STM32 Bluetooth device by the browser.
+React/Vite frontend and a Python FastAPI backend for activity measurements read from an STM32 Bluetooth device by the browser.
 
 ## Requirements
 
-- Node.js **24 or later** (check `node --version`). The backend uses Node's built-in SQLite and has no third-party dependencies. Node may print a SQLite experimental warning.
+- Python **3.10 or later** for the FastAPI backend.
+- Node.js **24 or later** for the frontend.
 - pnpm **10.34.3** for the frontend.
 - Two terminals, starting in `spokiy_app/`.
 
@@ -14,13 +15,16 @@ In PowerShell:
 
 ```powershell
 cd backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 Copy-Item .env.example .env
-npm run dev
+python -m uvicorn server:create_app --factory --host 127.0.0.1 --port 3001 --env-file .env --reload
 ```
 
-Use `npm.cmd` if PowerShell blocks the `npm.ps1` script. Copy `.env.example` only for initial setup; preserve your configuration on subsequent runs.
+Copy `.env.example` only for initial setup; preserve your configuration on subsequent runs. If PowerShell blocks activation, run `.venv\Scripts\python.exe` directly instead.
 
-The API listens at **http://127.0.0.1:3001**. Open http://127.0.0.1:3001/api/health to check it. For normal operation without file watching, run `npm start`. Stop with Ctrl+C.
+The API listens at **http://127.0.0.1:3001**. Open http://127.0.0.1:3001/api/health to check it. For normal operation without file watching, omit `--reload`. Uvicorn command-line options determine the host and port. Stop with Ctrl+C.
 
 SQLite tables are created automatically in `backend/data/spokiy.sqlite`. Accounts, sessions, profiles, devices, and measurements survive restarts. This directory and `.env` are excluded from Git. Paths are relative to the backend working directory. No separate database installation is needed.
 
@@ -66,9 +70,22 @@ Click **Connect device**, then **Find Bluetooth devices**. Choose your STM32 tra
 
 Use a browser with Web Bluetooth support, such as Chrome or Edge on Windows. Open the app on localhost for development, or HTTPS in production. The hardware must advertise Bluetooth Low Energy (BLE); Bluetooth Classic serial modules cannot use this GATT flow.
 
-**Current limitation:** device selection and GATT connection are implemented. Measurement subscription, decoding, and automatic uploads cannot be completed until the STM32 firmware service UUID, notification characteristic UUID, and payload layout are supplied. The dialog explicitly distinguishes connection from measurement syncing. No readings are fabricated. Manual registration and JSON upload forms have been removed from the normal connection flow.
+The tracker firmware creates a custom service on ST's `BLE_AT_Server`. The website defaults to these UUIDs:
 
-If the service UUID is known, set `$env:VITE_BLE_SERVICE_UUID="your-service-uuid"` in the frontend terminal before starting Vite. This grants access to that service during pairing; it does not yet implement its measurement decoder. Once the firmware protocol is available, decoded readings can be sent using `uploadMeasurements` in `frontend/src/api.ts`.
+- Service: `0000aabb-cc7a-482a-984a-7f2ed5b3e58f`
+- Notification characteristic: `00003344-8e22-4541-9d4c-21edae82ed19`
+
+Build and flash the main STM32 firmware with `HAR_BLE_ENABLED` set to `1` in `Core/Inc/har_ble.h` (the default). The STM32WB5MMG module must already have a compatible ST BLE stack and `BLE_AT_Server` installed; see the repository's [BLE setup guide](../firmware/BLE_SETUP.md). Power-cycle the board after flashing, then use **Connect device** and choose `Spokiy` if it appears. Chrome or Edge on a Bluetooth-capable Windows computer and localhost or HTTPS are required; iPhone browsers do not support this Web Bluetooth flow. Close the phone's BLE connection first if the board cannot accept another connection.
+
+Check the service with a BLE scanner and test notifications on the board. The implementation is unverified on hardware. The latest prediction is saved for explicitly authorized administrators; predictions are not uploaded as steps. They are sent as newline-terminated UTF-8 text split into notifications of at most 18 bytes; the browser reassembles them.
+
+To override the UUIDs for a compatible server, set `VITE_BLE_SERVICE_UUID` and `VITE_BLE_CHARACTERISTIC_UUID` in the frontend environment before starting Vite. Both must match the running firmware.
+
+## Administrator monitoring
+
+During registration choose a regular user or administrator account. Administrators cannot access other accounts automatically. A regular user can share their latest activity with an administrator by entering their registered email on the dashboard, and can revoke access there at any time. Administrators see authorized users and their most recently received activity; the dashboard polls the server every three seconds and shows an in-app notice when an observed activity changes. An old timestamp means the status may no longer be current. Activity is sent only while the user's browser is connected to the tracker and backend.
+
+The model does not classify falls, so the app does not generate sudden-drop or fall alerts. It is not a safety monitoring or emergency notification system. An administrator account does not grant access to private measurements or profiles.
 
 ## API
 
@@ -77,7 +94,7 @@ Requests and responses use JSON. Errors return `{ "error": "message" }`. For POS
 | Method | Endpoint | Body / result |
 | --- | --- | --- |
 | GET | `/api/health` | Public health check |
-| POST | `/api/auth/register` | `{ email, password }`; creates account and signs in |
+| POST | `/api/auth/register` | `{ email, password, role }`; role is `user` or `admin` |
 | POST | `/api/auth/login` | `{ email, password }`; signs in |
 | POST | `/api/auth/logout` | `{}`; revokes current session |
 | GET | `/api/auth/me` | `{ user: { id, email, createdAt } }` |
@@ -140,7 +157,7 @@ For real Bluetooth integration:
 3. Register `BluetoothDevice.id` through `/api/devices`; retain the returned backend device ID.
 4. Queue decoded samples locally, then upload batches of 1–500 samples. Only remove queued samples after a successful response. Retain the same sample IDs when retrying.
 
-The firmware's BLE service UUID, characteristic UUID, payload layout, timestamp source, and counter semantics must be supplied before implementing the real Bluetooth reader. Use a browser that supports Web Bluetooth; production requires HTTPS, while localhost can be used for local development.
+Hardware notification behavior must be verified before using the Bluetooth reader; timestamp and counter semantics must be established before uploading measurements. Use a browser that supports Web Bluetooth; production requires HTTPS, while localhost can be used for local development.
 
 Measurement contract:
 
@@ -156,7 +173,7 @@ Every batch is validated before insertion and inserted in a transaction. Invalid
 
 ```powershell
 cd backend
-npm test
+python -m unittest discover -s test -p "test_*.py"
 ```
 
 Tests use an isolated temporary SQLite file and exercise registration, login/logout, validation, profile persistence, restart persistence, device ownership, atomic batch validation, duplicate uploads, summaries, and history.
@@ -169,10 +186,10 @@ npx.cmd --yes pnpm@10.34.3 typecheck
 npx.cmd --yes pnpm@10.34.3 test
 ```
 
-The frontend test builds the app and uses an in-memory backend on temporary ports; it does not modify your account database. It checks registration cookies, authenticated profile changes, device registration, measurement uploads, dashboard totals, and logout through both proxies. It is an HTTP integration test; browser interactions and physical Bluetooth hardware need separate manual verification.
+The frontend test builds the app and starts a temporary FastAPI backend; set `SPOKIY_PYTHON` to the backend virtual environment?s Python executable if needed; it does not modify your account database. It checks registration cookies, authenticated profile changes, device registration, measurement uploads, dashboard totals, and logout through both proxies. It is an HTTP integration test; browser interactions and physical Bluetooth hardware need separate manual verification.
 
 ## Deployment notes
 
 This is a single-process backend suitable for local development and an initial small deployment. Before public deployment, serve both apps over HTTPS (preferably through the same origin), set `COOKIE_SECURE=true`, set the exact frontend origin, back up SQLite using a consistent SQLite backup procedure, and add password recovery/email verification as needed. The in-memory authentication limiter is per process and resets on restart; use a shared limiter when scaling. The API currently has no password recovery, account deletion, or device removal endpoints.
 
-SQLite API reference: https://nodejs.org/docs/latest-v24.x/api/sqlite.html
+FastAPI documentation: https://fastapi.tiangolo.com/
