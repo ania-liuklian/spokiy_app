@@ -83,36 +83,6 @@ function Icon({ name, className = "h-5 w-5" }: { name: IconName; className?: str
   );
 }
 
-const activityLabels = ["Lying", "Stationary", "Walking", "Running", "Stairs"];
-
-function ActivityColumns({ activity }: { activity: string | null }) {
-  const predictedActivity = activity?.trim().toLowerCase();
-
-  return (
-    <div className="mt-3 overflow-x-auto">
-      <ul aria-label="Activity classes" className="grid min-w-60 grid-cols-5 gap-1 sm:gap-3">
-        {activityLabels.map((label) => {
-          const predicted = label.toLowerCase() === predictedActivity;
-
-          return (
-            <li
-              key={label}
-              aria-current={predicted || undefined}
-              className={`rounded-lg border px-0.5 py-3 text-center text-[10px] font-semibold sm:text-sm ${
-                predicted
-                  ? "border-[#214f39] bg-[#214f39] text-white"
-                  : "border-[#dce4de] bg-[#f4f7f4] text-[#54615b]"
-              }`}
-            >
-              {label}
-            </li>
-          );
-        })}
-      </ul>
-    </div>
-  );
-}
-
 function App() {
   const [user, setUser] = useState<User | null>(null);
   const [checkingSession, setCheckingSession] = useState(true);
@@ -609,19 +579,30 @@ function App() {
               {monitored.length === 0 && <p className="mt-4 text-sm text-[#748078]">No users are sharing activity with you yet.</p>}
               <ul className="mt-4 space-y-3">{monitored.map(person => <li key={person.id} className="rounded-xl bg-[#f2f5f2] p-4">
                 <p className="font-semibold">{person.email}</p>
-                <ActivityColumns activity={person.activity} />
                 <p className="mt-1">{person.activity || "No activity received"}{person.confidence != null && ` (${(person.confidence * 100).toFixed(1)}% confidence)`}</p>
                 <p className="mt-1 text-sm text-[#748078]">{person.receivedAt ? `Last received: ${new Date(person.receivedAt).toLocaleString()}${Date.now() - Date.parse(person.receivedAt) > 30000 ? " ? not recently updated" : ""}` : "Waiting for data"}</p>
               </li>)}</ul>
               <p className="mt-4 text-xs text-[#748078]">Activity classifications do not detect falls. Check the last received time to judge whether a reading is current.</p>
             </section> : <>
-            <section aria-live="polite" className="mb-6 rounded-2xl border border-[#e3e8e4] bg-white p-6">
+            <section className="mb-6 rounded-2xl border border-[#e3e8e4] bg-white p-3 sm:p-6">
               <h2 className="font-bold">Live activity prediction</h2>
-              <ActivityColumns activity={prediction?.activity ?? null} />
-              {prediction ? <div className="mt-3"><p className="sr-only">Predicted activity: {prediction.activity}</p>
-                <p className="mt-1 text-sm text-[#748078]">Model confidence: {(prediction.confidence * 100).toFixed(1)}% ? received {prediction.receivedAt.toLocaleTimeString()}</p>
-                {!bleSubscribed && <p className="mt-1 text-sm text-[#748078]">Disconnected ? showing the last reading.</p>}
-              </div> : <p className="mt-3 text-sm text-[#748078]">{bleSubscribed ? "Waiting for a prediction from the tracker?" : "Connect your tracker with Bluetooth to see live predictions."}</p>}
+              <ul aria-label="Activity classes" className="mt-3 grid grid-cols-5 gap-1 text-center text-[11px] sm:gap-2 sm:text-sm">
+                {["Lying", "Stationary", "Walking", "Running", "Stairs"].map(activity => {
+                  const isTopPrediction = prediction?.activity.toLowerCase() === activity.toLowerCase();
+                  return (
+                    <li key={activity} className={`break-words rounded-lg px-0.5 py-3 sm:px-2 ${isTopPrediction ? "bg-[#214f39] font-bold text-white" : "bg-[#f2f5f2] text-[#405048]"}`}>
+                      {activity}
+                      {isTopPrediction && <span className="sr-only"> (top prediction)</span>}
+                    </li>
+                  );
+                })}
+              </ul>
+              <div aria-live="polite" className="mt-3 text-sm text-[#748078]">
+                {prediction ? <>
+                  <p>{prediction.activity} · {(prediction.confidence * 100).toFixed(1)}% model confidence · received {prediction.receivedAt.toLocaleTimeString()}</p>
+                  {!bleSubscribed && <p className="mt-1">Disconnected. Showing the last reading.</p>}
+                </> : <p>{bleSubscribed ? "Waiting for a prediction from the tracker." : "Connect your tracker with Bluetooth to see live predictions."}</p>}
+              </div>
               <p className="mt-2 text-xs text-[#748078]">Predictions do not update step counts.</p>
             </section>
             <section className="mb-6 rounded-2xl border border-[#e3e8e4] bg-white p-6">

@@ -47,7 +47,9 @@ export async function pairDevice(
   }
 }
 
-// Accept complete predictions sent as one notification and newline-delimited fragments.
+// The firmware sends each prediction as a CRLF-terminated line, split across
+// notifications of at most 18 bytes, so payloads are accumulated until a "\n"
+// arrives before parsing. See firmware/BLE_SETUP.md.
 export async function subscribePredictions(
   device: BluetoothDevice,
   serviceUuid: string,
@@ -63,16 +65,7 @@ export async function subscribePredictions(
   let pending = "";
   const listener = () => {
     if (!characteristic.value) return;
-    const chunk = decoder.decode(characteristic.value, { stream: true });
-    if (!chunk.includes("\n")) {
-      const prediction = parsePrediction(chunk);
-      if (prediction) {
-        pending = "";
-        onPrediction(prediction);
-        return;
-      }
-    }
-    pending += chunk;
+    pending += decoder.decode(characteristic.value, { stream: true });
     const lines = pending.split("\n");
     pending = lines.pop() || "";
     if (pending.length > 512) pending = "";

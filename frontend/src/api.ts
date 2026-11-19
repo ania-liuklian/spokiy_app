@@ -1,5 +1,3 @@
-const API_BASE = (import.meta.env.VITE_API_URL || "").replace(/\/+$/, "");
-
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -12,7 +10,7 @@ export class ApiError extends Error {
 export async function api<T>(path: string, method = "GET", body?: unknown): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${API_BASE}/api${path}`, {
+    response = await fetch(`/api${path}`, {
       method,
       credentials: "include",
       headers: body === undefined ? {} : { "Content-Type": "application/json" },

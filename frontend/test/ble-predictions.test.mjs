@@ -25,14 +25,9 @@ test("subscribes to the configured characteristic and decodes notification bytes
   characteristic.value = new DataView(new TextEncoder().encode("# rate=27 Hz\n").buffer);
   characteristic.dispatchEvent(new Event("characteristicvaluechanged"));
   assert.equal(values.length, 1);
-  characteristic.value = new DataView(encode("# pred t=26000 class=Walking p=0.92").buffer);
-  characteristic.dispatchEvent(new Event("characteristicvaluechanged"));
-  assert.equal(values.length, 2);
-  assert.equal(values[1].activity, "Walking");
-  assert.equal(values[1].confidence, 0.92);
   unsubscribe(); unsubscribe();
   characteristic.dispatchEvent(new Event("characteristicvaluechanged"));
-  assert.equal(values.length, 2);
+  assert.equal(values.length, 1);
   assert.equal(starts, 1); assert.equal(stops, 1);
 });
 
