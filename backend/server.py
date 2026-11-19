@@ -186,14 +186,14 @@ def create_app(database_path=None, origin=None, secure=None):
                 db.execute('DELETE FROM sessions WHERE expires<=?', (millis,))
                 db.execute('INSERT INTO sessions VALUES(?,?,?)', (hashlib.sha256(token.encode()).hexdigest(), user['id'], millis + 7*86400000))
             response = JSONResponse({'user': public(user)}, status_code=201 if action == 'register' else 200)
-            response.set_cookie('spokiy_session', token, max_age=7*86400, httponly=True, samesite='lax', secure=secure, path='/')
+            response.set_cookie('spokiy_session', token, max_age=7*86400, httponly=True, samesite='none', secure=secure, path='/')
             return response
         user_for(request)
         if action == 'logout':
             with db:
                 db.execute('DELETE FROM sessions WHERE token=?', (hashlib.sha256(request.cookies.get('spokiy_session', '').encode()).hexdigest(),))
             response = JSONResponse({'ok': True})
-            response.set_cookie('spokiy_session', '', max_age=0, httponly=True, samesite='lax', secure=secure, path='/')
+            response.set_cookie('spokiy_session', '', max_age=0, httponly=True, samesite='none', secure=secure, path='/')
             return response
         fail(404, 'Endpoint not found')
 
