@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: spokiy-app
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_PATH
+        value: /tmp/spokiy.sqlite

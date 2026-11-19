@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 
 def now():
@@ -335,6 +336,10 @@ def create_app(database_path=None, origin=None, secure=None):
             return {'from': start, 'to': end, **dict(row)}
         rows = db.execute('SELECT substr(m.recorded_at,1,10) AS date,SUM(m.steps) AS steps,AVG(m.heart_rate) AS averageHeartRate' + where + ' GROUP BY date ORDER BY date', (user['id'], start, end))
         return {'from': start, 'to': end, 'days': [dict(row) for row in rows]}
+
+    frontend_dist = os.getenv('FRONTEND_DIST')
+    if frontend_dist:
+        app.mount('/', StaticFiles(directory=frontend_dist, html=True), name='frontend')
 
     return app
 

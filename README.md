@@ -190,6 +190,10 @@ The frontend test builds the app and starts a temporary FastAPI backend; set `SP
 
 ## Deployment notes
 
+For a free demo, create a Blueprint in the [Render dashboard](https://dashboard.render.com/) and connect this GitHub repository. The root `render.yaml` provisions one Free web service. Open its `onrender.com` URL for the app and use `/api/health` to check FastAPI. The container serves the built frontend and the API on the same HTTPS origin.
+
+Use test accounts for this deployment. Render Free can take about a minute to wake after 15 minutes idle, and the SQLite database is reset on spin-down, restart, and redeploy. Keep the workspace on the Free plan without a payment method to avoid overage charges.
+
 This is a single-process backend suitable for local development and an initial small deployment. Before public deployment, serve both apps over HTTPS (preferably through the same origin), set `COOKIE_SECURE=true`, set the exact frontend origin, back up SQLite using a consistent SQLite backup procedure, and add password recovery/email verification as needed. The in-memory authentication limiter is per process and resets on restart; use a shared limiter when scaling. The API currently has no password recovery, account deletion, or device removal endpoints.
 
 FastAPI documentation: https://fastapi.tiangolo.com/
