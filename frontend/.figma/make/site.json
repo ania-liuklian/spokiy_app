@@ -1,5 +1,8 @@
 {
   "title": "Spokiy",
+  "icons": {
+    "icon": "/spokiy.svg"
+  },
   "description": "Track activity with an STM32-based device, connect over Bluetooth, and view personal data through a simple account and profile experience.",
   "robots": {
     "index": false
