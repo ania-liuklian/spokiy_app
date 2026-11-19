@@ -194,6 +194,10 @@ For a free demo, create a Blueprint in the [Render dashboard](https://dashboard.
 
 Use test accounts for this deployment. Render Free can take about a minute to wake after 15 minutes idle, and the SQLite database is reset on spin-down, restart, and redeploy. Keep the workspace on the Free plan without a payment method to avoid overage charges.
 
+To keep data on Render Free, create a free Postgres project in [Neon](https://console.neon.tech/) and copy its pooled connection string. In the Render service's **Environment** tab, add `DATABASE_URL` with that connection string and redeploy. Keep the connection string in Render's environment settings. FastAPI initializes the PostgreSQL tables on startup. Local development defaults to SQLite when `DATABASE_URL` is unset.
+
+A new PostgreSQL database starts empty. Back up any SQLite database you want to retain before switching. Restarting Render will discard any SQLite data still held on its temporary filesystem.
+
 This is a single-process backend suitable for local development and an initial small deployment. Before public deployment, serve both apps over HTTPS (preferably through the same origin), set `COOKIE_SECURE=true`, set the exact frontend origin, back up SQLite using a consistent SQLite backup procedure, and add password recovery/email verification as needed. The in-memory authentication limiter is per process and resets on restart; use a shared limiter when scaling. The API currently has no password recovery, account deletion, or device removal endpoints.
 
 FastAPI documentation: https://fastapi.tiangolo.com/

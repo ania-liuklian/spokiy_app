@@ -1,6 +1,7 @@
 *
 !backend/
 !backend/server.py
+!backend/database.py
 !backend/requirements.txt
 !frontend/
 !frontend/**

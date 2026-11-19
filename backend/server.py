@@ -5,16 +5,16 @@ import math
 import os
 import re
 import secrets
-import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone, date, timedelta
-from pathlib import Path
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+
+from database import open_database
 
 
 def now():
@@ -54,32 +54,18 @@ def number(value):
 
 
 def create_app(database_path=None, origin=None, secure=None):
-    database_path = database_path or os.getenv('DATABASE_PATH', './data/spokiy.sqlite')
     origin = origin or os.getenv('FRONTEND_ORIGIN', 'http://localhost:8443')
     secure = secure if secure is not None else os.getenv('COOKIE_SECURE') == 'true'
-    if database_path != ':memory:':
-        Path(database_path).resolve().parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(database_path, check_same_thread=False)
-    db.row_factory = sqlite3.Row
-    db.executescript('''PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
-    CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT NOT NULL UNIQUE,password TEXT NOT NULL,created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS profiles(user_id TEXT PRIMARY KEY REFERENCES users(id),data TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),expires INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),identifier TEXT NOT NULL,name TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(user_id,identifier));
-    CREATE TABLE IF NOT EXISTS measurements(device_id TEXT NOT NULL REFERENCES devices(id),sample_id TEXT NOT NULL,recorded_at TEXT NOT NULL,steps INTEGER NOT NULL,heart_rate REAL,battery REAL,PRIMARY KEY(device_id,sample_id));
-    CREATE INDEX IF NOT EXISTS measurements_time ON measurements(device_id,recorded_at);''')
-    if 'role' not in {row['name'] for row in db.execute('PRAGMA table_info(users)')}:
-        db.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
-    db.executescript("""
-    CREATE TABLE IF NOT EXISTS monitoring_grants(user_id TEXT NOT NULL REFERENCES users(id), admin_id TEXT NOT NULL REFERENCES users(id), PRIMARY KEY(user_id, admin_id));
-    CREATE TABLE IF NOT EXISTS live_predictions(user_id TEXT PRIMARY KEY REFERENCES users(id), activity TEXT NOT NULL, confidence REAL NOT NULL, device_time INTEGER NOT NULL, received_at TEXT NOT NULL);
-    """)
+    database_url = os.getenv('DATABASE_URL') if database_path is None else None
+    db = open_database(database_path or os.getenv('DATABASE_PATH', './data/spokiy.sqlite'), database_url)
     limits = {}
 
     @asynccontextmanager
     async def lifespan(app):
-        yield
-        db.close()
+        try:
+            yield
+        finally:
+            db.close()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -110,7 +96,9 @@ def create_app(database_path=None, origin=None, secure=None):
                     if not isinstance(body, dict):
                         fail(400, 'Expected JSON object')
                     request.state.body = body
-                response = await call_next(request)
+                use_database = request.url.path.startswith('/api/') and request.url.path != '/api/health'
+                async with db.request(use_database):
+                    response = await call_next(request)
         except APIError as error:
             response = JSONResponse({'error': error.message}, status_code=error.status)
         for key, value in headers.items():
@@ -170,10 +158,10 @@ def create_app(database_path=None, origin=None, secure=None):
                 digest = hashlib.scrypt(password.encode(), salt=salt.encode(), n=16384, r=8, p=1, dklen=64).hex()
                 uid, created = str(uuid.uuid4()), iso(now())
                 try:
-                    with db:
+                    with db.transaction():
                         db.execute('INSERT INTO users(id,email,password,created_at,role) VALUES(?,?,?,?,?)', (uid, email, f'{salt}:{digest}', created, role))
                         db.execute('INSERT INTO profiles VALUES(?,?)', (uid, json.dumps({'firstName': '', 'lastName': '', 'dailyStepGoal': 10000})))
-                except sqlite3.IntegrityError:
+                except db.integrity_error:
                     fail(409, 'Email already registered')
                 user = db.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()
             else:
@@ -183,7 +171,7 @@ def create_app(database_path=None, origin=None, secure=None):
                     fail(401, 'Invalid email or password')
             token = secrets.token_hex(32)
             millis = int(time.time() * 1000)
-            with db:
+            with db.transaction():
                 db.execute('DELETE FROM sessions WHERE expires<=?', (millis,))
                 db.execute('INSERT INTO sessions VALUES(?,?,?)', (hashlib.sha256(token.encode()).hexdigest(), user['id'], millis + 7*86400000))
             response = JSONResponse({'user': public(user)}, status_code=201 if action == 'register' else 200)
@@ -191,7 +179,7 @@ def create_app(database_path=None, origin=None, secure=None):
             return response
         user_for(request)
         if action == 'logout':
-            with db:
+            with db.transaction():
                 db.execute('DELETE FROM sessions WHERE token=?', (hashlib.sha256(request.cookies.get('spokiy_session', '').encode()).hexdigest(),))
             response = JSONResponse({'ok': True})
             response.set_cookie('spokiy_session', '', max_age=0, httponly=True, samesite='lax', secure=secure, path='/')
@@ -227,7 +215,7 @@ def create_app(database_path=None, origin=None, secure=None):
                 else:
                     fail(400, f'Unknown profile field: {key}')
                 result[key] = value
-            with db:
+            with db.transaction():
                 db.execute('UPDATE profiles SET data=? WHERE user_id=?', (json.dumps(result), user['id']))
         return {'profile': result, 'email': user['email']}
 
@@ -242,8 +230,11 @@ def create_app(database_path=None, origin=None, secure=None):
         if existing:
             return {'device': dict(existing)}
         device = {'id': str(uuid.uuid4()), 'identifier': identifier, 'name': name, 'created_at': iso(now())}
-        with db:
-            db.execute('INSERT INTO devices VALUES(?,?,?,?,?)', (device['id'], user['id'], identifier, name, device['created_at']))
+        with db.transaction():
+            inserted = db.execute('INSERT INTO devices VALUES(?,?,?,?,?) ON CONFLICT(user_id,identifier) DO NOTHING', (device['id'], user['id'], identifier, name, device['created_at'])).rowcount
+        if not inserted:
+            existing = db.execute('SELECT * FROM devices WHERE user_id=? AND identifier=?', (user['id'], identifier)).fetchone()
+            return {'device': dict(existing)}
         return JSONResponse({'device': device}, status_code=201)
 
     @app.post('/api/devices/{device_id}/measurements')
@@ -269,7 +260,7 @@ def create_app(database_path=None, origin=None, secure=None):
                 if value is not None and (not number(value) or not 0 <= value <= maximum):
                     fail(400, f'Invalid {key}')
             rows.append((device_id, sid, stamp, steps, item.get('heartRate'), item.get('battery')))
-        with db:
+        with db.transaction():
             inserted = sum(db.execute('INSERT INTO measurements VALUES(?,?,?,?,?,?) ON CONFLICT(device_id,sample_id) DO NOTHING', row).rowcount for row in rows)
         return {'inserted': inserted, 'duplicates': len(rows)-inserted}
 
@@ -282,15 +273,15 @@ def create_app(database_path=None, origin=None, secure=None):
             return {'admins': [dict(row) for row in db.execute('SELECT u.id,u.email FROM monitoring_grants g JOIN users u ON u.id=g.admin_id WHERE g.user_id=? ORDER BY u.email', (user['id'],))]}
         if request.method == 'DELETE':
             admin_id = request.query_params.get('adminId', '')
-            with db:
+            with db.transaction():
                 db.execute('DELETE FROM monitoring_grants WHERE user_id=? AND admin_id=?', (user['id'], admin_id))
             return {'ok': True}
         email = text(request.state.body.get('email'), 'email', 254).lower()
         admin = db.execute("SELECT id,email FROM users WHERE email=? AND role='admin'", (email,)).fetchone()
         if not admin:
             fail(404, 'Administrator not found')
-        with db:
-            db.execute('INSERT OR IGNORE INTO monitoring_grants VALUES(?,?)', (user['id'], admin['id']))
+        with db.transaction():
+            db.execute('INSERT INTO monitoring_grants VALUES(?,?) ON CONFLICT(user_id,admin_id) DO NOTHING', (user['id'], admin['id']))
         return {'admin': dict(admin)}
 
     @app.post('/api/predictions')
@@ -309,8 +300,8 @@ def create_app(database_path=None, origin=None, secure=None):
         if not number(device_time) or device_time % 1 or not 0 <= device_time <= 4294967295:
             fail(400, 'Invalid deviceTime')
         received = iso(now())
-        with db:
-            db.execute('INSERT INTO live_predictions VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET activity=excluded.activity,confidence=excluded.confidence,device_time=excluded.device_time,received_at=excluded.received_at', (user['id'], label, confidence, device_time, received))
+        with db.transaction():
+            db.execute('INSERT INTO live_predictions VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET activity=excluded.activity,confidence=excluded.confidence,device_time=excluded.device_time,received_at=excluded.received_at', (user['id'], label, confidence, int(device_time), received))
         return {'ok': True, 'receivedAt': received}
 
     @app.get('/api/monitoring/users')
@@ -318,7 +309,7 @@ def create_app(database_path=None, origin=None, secure=None):
         user = user_for(request)
         if user['role'] != 'admin':
             fail(403, 'Administrator account required')
-        rows = db.execute('SELECT u.id,u.email,p.activity,p.confidence,p.device_time AS deviceTime,p.received_at AS receivedAt FROM monitoring_grants g JOIN users u ON u.id=g.user_id LEFT JOIN live_predictions p ON p.user_id=u.id WHERE g.admin_id=? ORDER BY u.email', (user['id'],))
+        rows = db.execute('SELECT u.id,u.email,p.activity,p.confidence,p.device_time AS "deviceTime",p.received_at AS "receivedAt" FROM monitoring_grants g JOIN users u ON u.id=g.user_id LEFT JOIN live_predictions p ON p.user_id=u.id WHERE g.admin_id=? ORDER BY u.email', (user['id'],))
         return {'users': [dict(row) for row in rows]}
 
     @app.get('/api/activity/{kind}')
@@ -332,9 +323,9 @@ def create_app(database_path=None, origin=None, secure=None):
             fail(400, 'Use a time range greater than zero and at most 366 days')
         where = ' FROM measurements m JOIN devices d ON d.id=m.device_id WHERE d.user_id=? AND m.recorded_at>=? AND m.recorded_at<?'
         if kind == 'summary':
-            row = db.execute('SELECT COALESCE(SUM(m.steps),0) AS steps, AVG(m.heart_rate) AS averageHeartRate, COUNT(*) AS samples' + where, (user['id'], start, end)).fetchone()
+            row = db.execute('SELECT COALESCE(SUM(m.steps),0) AS steps, AVG(m.heart_rate) AS "averageHeartRate", COUNT(*) AS samples' + where, (user['id'], start, end)).fetchone()
             return {'from': start, 'to': end, **dict(row)}
-        rows = db.execute('SELECT substr(m.recorded_at,1,10) AS date,SUM(m.steps) AS steps,AVG(m.heart_rate) AS averageHeartRate' + where + ' GROUP BY date ORDER BY date', (user['id'], start, end))
+        rows = db.execute('SELECT substr(m.recorded_at,1,10) AS date,SUM(m.steps) AS steps,AVG(m.heart_rate) AS "averageHeartRate"' + where + ' GROUP BY date ORDER BY date', (user['id'], start, end))
         return {'from': start, 'to': end, 'days': [dict(row) for row in rows]}
 
     frontend_dist = os.getenv('FRONTEND_DIST')
