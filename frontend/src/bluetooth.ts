@@ -47,7 +47,7 @@ export async function pairDevice(
   }
 }
 
-// The firmware flushes each short prediction as a single notification without a newline.
+// Accept complete predictions sent as one notification and newline-delimited fragments.
 export async function subscribePredictions(
   device: BluetoothDevice,
   serviceUuid: string,
@@ -63,7 +63,16 @@ export async function subscribePredictions(
   let pending = "";
   const listener = () => {
     if (!characteristic.value) return;
-    pending += decoder.decode(characteristic.value, { stream: true });
+    const chunk = decoder.decode(characteristic.value, { stream: true });
+    if (!chunk.includes("\n")) {
+      const prediction = parsePrediction(chunk);
+      if (prediction) {
+        pending = "";
+        onPrediction(prediction);
+        return;
+      }
+    }
+    pending += chunk;
     const lines = pending.split("\n");
     pending = lines.pop() || "";
     if (pending.length > 512) pending = "";
